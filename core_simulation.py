@@ -9,6 +9,7 @@ from libpysal.weights import Queen
 from pykrige.ok import OrdinaryKriging
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
+from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.metrics import r2_score
 import matplotlib.pyplot as plt
 from loess.loess_2d import loess_2d # https://pypi.org/project/loess/#toc-entry-1
@@ -19,6 +20,7 @@ import pandas as pd
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import GridSearchCV
 
+# def make_data(grid_size, true_price_per_isq, lv_noise_sd, lv_to_isq_factor, isq_noise_sd, iv_noise_factor, iv_noise_sd, tv_obs_noise, isq_from_lv):
 def make_data(grid_size, true_price_per_isq, lv_center, lv_decay, lv_noise_sd, isq_noise_sd, iv_noise_factor, iv_noise_sd, tv_obs_noise, isq_from_lv):
     x, y = np.mgrid[0:grid_size, 0:grid_size]
     pos = np.empty(x.shape + (2,))
@@ -30,6 +32,7 @@ def make_data(grid_size, true_price_per_isq, lv_center, lv_decay, lv_noise_sd, i
     distances = np.random.normal(distances, lv_noise_sd, pos.shape[:2]) # there used to be (accidentally) a magic number rescaling lv_noise_sd...i've removed it and rescaled lv_noise_sd
 
     lv_true = lv_center * np.exp(-lv_decay*distances)
+    # lv_true = np.random.normal(lv_true, lv_true * lv_noise_sd)
 
     isq_true = np.random.normal(lv_true, abs(lv_true*isq_noise_sd), size=lv_true.shape) # i think the noise in square footage should also be proportional to land value. you see bigger variations in isq and other improvements downtown (skyscraper next to vacant) than in rural (sfh next to vacant)
     np.clip(isq_true, 0, None, out=isq_true) # these are effectively vacant lots.
@@ -72,6 +75,27 @@ def calculate_spatial_autocorr(df_true):
     morans = pd.Series(morans, index=['lv_true','iv_true','tv_true'])
     return morans
 
+def greedy_nearest_neighbor(distances, start_node=0):
+    num_nodes = distances.shape[0]
+    visited = [False] * num_nodes
+    path = [start_node]
+    visited[start_node] = True
+    current_node = start_node
+
+    for _ in range(num_nodes - 1):
+        next_node = -1
+        min_distance = float('inf')
+        for i in range(num_nodes):
+            if not visited[i] and distances[current_node][i] < min_distance:
+                min_distance = distances[current_node][i]
+                next_node = i
+
+        path.append(next_node)
+        visited[next_node] = True
+        current_node = next_node
+    
+    return path
+
 
 def fit_data(df_true, train_n):
 
@@ -80,7 +104,11 @@ def fit_data(df_true, train_n):
     df_train = df_true[train_idx]
     df_test  = df_true[~train_idx]
 
-    df_train_diff = df_train[['isq_true', 'tv_observed']].diff().dropna()
+    distances     = euclidean_distances(df_train[['x', 'y']])
+    path          = greedy_nearest_neighbor(distances)
+    df_train_diff = df_train.iloc[path][['isq_true', 'tv_observed']].diff().dropna()
+
+    # df_train_diff = df_train[['isq_true', 'tv_observed']].diff().dropna()
 
     lr = LinearRegression(fit_intercept=False)
     lr.fit(y=df_train_diff['tv_observed'],
@@ -88,6 +116,7 @@ def fit_data(df_true, train_n):
 
     iv_pred  = lr.predict(df_train['isq_true'].values.reshape(-1,1))
     df_train = df_train.assign(iv_pred=iv_pred,
+                            #    lv_pred=df_train['tv_observed'] - iv_pred)
                                lv_pred=np.clip(df_train['tv_observed'] - iv_pred, 0, None))
 
     # knn regression
@@ -100,12 +129,17 @@ def fit_data(df_true, train_n):
 
     # 2d LOESS Regression
 
+    # try:
     zoutdeg1, _ = loess_2d(x=df_train['x'].values, y=df_train['y'].values, z=df_train['lv_pred'].values,
                             xnew=df_test['x'].values, ynew=df_test['y'].values,
                             degree=1, frac=0.5, npoints=None, rescale=False, sigz=None)
     zoutdeg2, _ = loess_2d(x=df_train['x'].values, y=df_train['y'].values, z=df_train['lv_pred'].values,
                             xnew=df_test['x'].values, ynew=df_test['y'].values,
                             degree=2, frac=0.5, npoints=None, rescale=False, sigz=None)
+    # except np.linalg.LinAlgError:
+    #     df_train.to_csv('df_train.csv')
+    #     df_test.to_csv('df_test.csv')
+    #     raise
 
     # kriging (gaussian process regression?)
     zout_krig = fit_kriging(df_train, df_test)
@@ -141,6 +175,7 @@ def fit_knn(df_train, df_test):
 
     # Get the best k value
     best_k = grid_search.best_params_['n_neighbors']
+    #print("Best k:", best_k)
 
     # Fit the KNN model with the best k
     best_knn = KNeighborsRegressor(n_neighbors=best_k)
@@ -295,16 +330,18 @@ def evaluate_model(df_test):
  
 if __name__ == "__main__":
      
-    grid_size          = 100   # number of properties in the x and y dimension, grid_size = 100 makes 100 by 100 grid
-    true_price_per_isq = 4     # "dollars" per improved square foot
-    isq_from_lv        = True  # whether improved square footage should be generated from land values, or generated independently (with same process as land values)
+    grid_size          = 100              # number of properties in the x and y dimension, grid_size = 100 makes 100 by 100 grid
+    true_price_per_isq = 4               # "dollars" per improved square foot
+    isq_from_lv        = True             # whether improved square footage should be generated from land values, or generated independently (with same process as land values)
     
     lv_center        = 100000
     lv_decay         = .03
-    lv_noise_sd      = 1       # should really be called lv_noise_factor but keeping name for legacy reasons
-    isq_noise_sd     = 5e-1    # should really be called isq_noise_factor but keeping name for legacy reasons
+    lv_noise_sd      = 2 # should really be called lv_noise_factor but keeping name for legacy reasons
+    # lv_noise_sd      = .1 # should really be called lv_noise_factor but keeping name for legacy reasons
+    #lv_to_isq_factor = 1
+    isq_noise_sd     = 5e-1 # should really be called isq_noise_factor but keeping name for legacy reasons
     iv_noise_factor  = .3
-    iv_noise_sd      = None    # just a placeholder
+    iv_noise_sd      = None # just a placeholder
     tv_obs_noise     = 5e-2
     train_n          = 3
     
